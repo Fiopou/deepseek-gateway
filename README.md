@@ -43,22 +43,24 @@ pkg update -y
 pkg install python git -y
 git clone https://github.com/Fiopou/deepseek-gateway
 cd deepseek-gateway
-cp .env.example .env
 ```
 
-Впиши ключ в `.env` (в `nano`: Ctrl+X → y → Enter):
+Просто запусти — при первом запуске он сам попросит ключ и запомнит его:
 
-```
-BURNGATE_API_KEY=gk_твой_ключ
+```bash
+python gateway.py serve --port 8787           # спросит ключ один раз, потом поднимет шлюз
 ```
 
-Проверь и запусти:
+Вставь ключ `gk_...` (спрячется при вводе) — он сохранится в `.env` рядом со скриптом, и больше спрашивать не будет.
+
+Другие команды:
 
 ```bash
 python gateway.py models                      # список моделей
-python gateway.py serve --port 8787           # поднять шлюз
 python gateway.py chat "привет" --stream      # чат прямо в терминале
 ```
+
+> Если ключ нужно ввести заново (например, сменил) — удали строку `BURNGATE_API_KEY` из `.env` или отредактируй файл вручную: `nano .env`.
 
 Держи терминал открытым (или `tmux`), иначе шлюз умрёт.
 

@@ -63,13 +63,59 @@ def load_dotenv(path):
         pass
 
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+load_dotenv(ENV_PATH)
 
 
 def api_keys():
     """Один или несколько ключей burngate: BURNGATE_API_KEY / BURNGATE_API_KEYS через запятую."""
     raw = os.environ.get("BURNGATE_API_KEYS", "") or os.environ.get("BURNGATE_API_KEY", "")
     return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def save_key(key, path=ENV_PATH):
+    """Сохраняет ключ в .env, заменяя прежнее значение BURNGATE_API_KEY."""
+    lines = []
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if not ln.strip().startswith("BURNGATE_API_KEY=")]
+        except OSError:
+            lines = []
+    lines.append(f"BURNGATE_API_KEY={key}")
+    try:
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines).strip() + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def ensure_key():
+    """Первый запуск: спрашивает ключ burngate и сохраняет его в .env."""
+    if api_keys():
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        print("ERROR: нет ключа. Впиши BURNGATE_API_KEY=gk_... в .env рядом с gateway.py", file=sys.stderr)
+        return False
+    print("Ключ burngate не найден — настроим один раз.")
+    print("Взять ключ: https://burngate.space -> API keys.")
+    while True:
+        try:
+            import getpass
+            key = getpass.getpass("Вставь ключ burngate (gk_...): ").strip()
+        except Exception:
+            key = input("Вставь ключ burngate (gk_...): ").strip()
+        if key:
+            break
+        print("Пусто, попробуй ещё раз.")
+    os.environ["BURNGATE_API_KEY"] = key
+    if save_key(key):
+        print(f"Ключ сохранён в {ENV_PATH}\nБольше спрашивать не буду. Запускай снова в любой момент.")
+    else:
+        print("Не удалось записать .env — ключ принят только на этот запуск.", file=sys.stderr)
+    return True
 
 
 def resolve_model(name):
@@ -438,8 +484,7 @@ def main():
     sub.add_parser("models", help="список моделей burngate")
     args = ap.parse_args()
 
-    if not api_keys():
-        print("ERROR: нет ключа. Впиши BURNGATE_API_KEY=gk_... в .env рядом с gateway.py", file=sys.stderr)
+    if not ensure_key():
         sys.exit(1)
 
     if args.cmd == "models":
