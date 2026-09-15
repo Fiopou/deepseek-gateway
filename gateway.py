@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+# language: Python 3, target: Termux/Windows/Linux
+# deepseek-gateway - OpenAI-совместимый шлюз к burngate (DeepSeek V4.1 Flash).
+# Один файл, ноль зависимостей.
+#
+#   запрос клиента (джанитор/таверна/код) -> этот шлюз -> burngate
+#
+# Контракт burngate: POST https://burngate.space/api/v1/chat/completions
+#                    GET  https://burngate.space/api/v1/models
+# Авторизация: Authorization: Bearer <ключ gk_...>
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BURNGATE_BASE = os.environ.get("BURNGATE_BASE", "https://burngate.space/api/v1").rstrip("/")
+TIMEOUT = int(os.environ.get("GATEWAY_TIMEOUT", "300"))
+UA = "deepseek-gateway/1.0"
+
+# Модели burngate. Первая - модель по умолчанию.
+MODELS = [
+    "deepseek/deepseek-v4.1-flash",
+    "z-ai/glm-5.3-flash",
+]
+
+# Короткие имена для удобных клиентов -> полный id burngate.
+MODEL_ALIASES = {
+    "deepseek": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
+    "deepseek-v4.1": "deepseek/deepseek-v4.1-flash",
+    "deepseek-flash": "deepseek/deepseek-v4.1-flash",
+    "glm": "z-ai/glm-5.3-flash",
+    "glm-5.3-flash": "z-ai/glm-5.3-flash",
+}
+
+DEFAULT_MODEL = MODELS[0]
+DEFAULT_EFFORT = os.environ.get("BURNGATE_EFFORT", "high").strip() or "high"
+
+INTERNAL_FIELDS = ("_session", "_key")
+
+
+def load_dotenv(path):
+    """Простой парсер .env: KEY=VALUE, без зависимостей. Не перекрывает уже заданное."""
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip("'\"")
+                if k and v and k not in os.environ:
+                    os.environ[k] = v
+    except OSError:
+        pass
+
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+def api_keys():
+    """Один или несколько ключей burngate: BURNGATE_API_KEY / BURNGATE_API_KEYS через запятую."""
+    raw = os.environ.get("BURNGATE_API_KEYS", "") or os.environ.get("BURNGATE_API_KEY", "")
+    return [k.strip() for k in raw.split(",") if k.strip()]
+
+
+def resolve_model(name):
+    """Короткое имя -> полный id burngate. Неизвестное возвращаем как есть."""
+    if not name:
+        return DEFAULT_MODEL
+    return MODEL_ALIASES.get(name.strip().lower(), name.strip())
+
+
+class GatewayError(Exception):
+    def __init__(self, code, body, retry_after=None):
+        self.code = code
+        self.body = body
+        self.retry_after = retry_after
+        super().__init__(f"HTTP {code}: {body[:200]}")
+
+    def is_auth_error(self):
+        return self.code in (401, 402, 403)
+
+    def is_rate_limited(self):
+        return self.code in (429, 529) or "rate limit" in self.body.lower() or "RateLimit" in self.body
+
+    def retryable_with_next_key(self):
+        return self.is_auth_error() or self.is_rate_limited()
+
+
+def _request(payload):
+    """POST /chat/completions с перебором ключей при 401/402/403/429."""
+    keys = api_keys()
+    if not keys:
+        raise GatewayError(0, "BURNGATE_API_KEY не задан: впиши ключ в .env рядом с gateway.py", None)
+    if payload.get("_key") is not None:
+        keys = [payload["_key"]]
+    data = json.dumps({k: v for k, v in payload.items() if k not in INTERNAL_FIELDS}).encode("utf-8")
+    url = f"{BURNGATE_BASE}/chat/completions"
+    last = None
+    for i, key in enumerate(keys):
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "User-Agent": UA,
+        }
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            return urllib.request.urlopen(req, timeout=TIMEOUT)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")[:500]
+            last = GatewayError(e.code, body, e.headers.get("retry-after"))
+            if last.retryable_with_next_key() and i < len(keys) - 1:
+                if last.is_rate_limited():
+                    time.sleep(1)
+                continue
+            raise last
+        except urllib.error.URLError as e:
+            raise GatewayError(0, f"network: {e.reason}", None)
+    raise last
+
+
+def _iter_sse(resp):
+    """SSE: yield (json, done)."""
+    buf = b""
+    for raw in resp:
+        buf += raw
+        while b"\n\n" in buf:
+            chunk, buf = buf.split(b"\n\n", 1)
+            for line in chunk.split(b"\n"):
+                line = line.strip()
+                if not line or not line.startswith(b"data:"):
+                    continue
+                item = line[5:].strip()
+                if item == b"[DONE]":
+                    yield None, True
+                    return
+                try:
+                    yield json.loads(item.decode("utf-8")), False
+                except json.JSONDecodeError:
+                    continue
+    yield None, True
+
+
+def chat(model, messages, stream=False, **opts):
+    """Одиночный вызов burngate. Возвращает dict (не-стрим) или итератор чанков."""
+    payload = {"model": resolve_model(model), "messages": messages, "stream": bool(stream)}
+    payload.update({k: v for k, v in opts.items() if v is not None})
+    resp = _request(payload)
+    if not stream:
+        return json.loads(resp.read().decode("utf-8"))
+    return _iter_sse(resp)
+
+
+def list_models():
+    """Список моделей burngate; при недоступности - локальный список."""
+    req = urllib.request.Request(f"{BURNGATE_BASE}/models", headers={"User-Agent": UA})
+    keys = api_keys()
+    if keys:
+        req.add_header("Authorization", f"Bearer {keys[0]}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            ids = [m.get("id") or m.get("model") or m for m in (data.get("data") or data.get("models") or [])]
+            return ids or list(MODELS)
+    except Exception:
+        return list(MODELS)
+
+
+def estimate_tokens(messages):
+    """Грубая оценка: ~3 символа на токен."""
+    return sum(len(str(m.get("content", ""))) // 3 for m in messages)
+
+
+def _summarize(text):
+    prompt = (
+        "Сожми текст в краткое резюме. Сохрани все факты, код, имена, числа "
+        "и незавершённые задачи. Числа, коды, имена и ключевые термины перечисли "
+        "списком, ничего не теряя. Только резюме, без пояснений.\n\n" + text
+    )
+    resp = chat(DEFAULT_MODEL, [{"role": "user", "content": prompt}], max_tokens=800, reasoning_effort="none")
+    return (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+
+
+def compact_if_needed(messages, limit=None):
+    """Авто-расширение контекста: при превышении порога сжимает историю
+    в резюме (чанками, чтобы не упираться в таймауты)."""
+    limit = limit or int(os.environ.get("GATEWAY_MAX_CONTEXT", "0"))
+    if not limit or estimate_tokens(messages) <= limit:
+        return messages
+    chunk_size = int(os.environ.get("GATEWAY_COMPACT_CHUNK", "25000"))
+    for _ in range(3):
+        if estimate_tokens(messages) <= limit:
+            break
+        keep = messages[-4:]
+        history = messages[:-4]
+        text = "\n".join(f"{m.get('role')}: {str(m.get('content'))}" for m in history)
+        chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        summaries = []
+        for c in chunks:
+            try:
+                s = _summarize(c)
+            except GatewayError:
+                return messages
+            if s:
+                summaries.append(s)
+        if not summaries:
+            return messages
+        messages = [{"role": "system", "content": "Резюме прошлого диалога: " + " ".join(summaries)}] + keep
+    return messages
+
+
+def _print_stream(gen):
+    """Печатает SSE-поток, возвращает собранный текст ответа."""
+    parts = []
+    for chunk, done in gen:
+        if done:
+            break
+        for c in chunk.get("choices", []):
+            d = c.get("delta", {})
+            if d.get("reasoning_content"):
+                print(f"[think] {d['reasoning_content']}", file=sys.stderr, flush=True)
+            if d.get("content"):
+                parts.append(d["content"])
+                print(d["content"], end="", flush=True)
+    print()
+    return "".join(parts)
+
+
+def run_interactive(args):
+    model = resolve_model(args.model) if args.model else DEFAULT_MODEL
+    limit = int(os.environ.get("GATEWAY_MAX_CONTEXT", "0"))
+    messages = []
+    print(f"chat [burngate], model={model}, max_context={limit or 'off'}, /model <name> /new /quit")
+    while True:
+        try:
+            line = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            continue
+        if line in ("/quit", "/q", "/exit"):
+            return
+        if line == "/new":
+            messages = []
+            print("(history cleared)")
+            continue
+        if line.startswith("/model "):
+            model = resolve_model(line.split(" ", 1)[1].strip())
+            print(f"(model -> {model})")
+            continue
+        messages.append({"role": "user", "content": line})
+        messages = compact_if_needed(messages, limit)
+        try:
+            gen = chat(model, messages, stream=True, reasoning_effort=args.effort)
+            answer = _print_stream(gen)
+            messages.append({"role": "assistant", "content": answer or "(пустой ответ)"})
+        except GatewayError as e:
+            _report(e)
+            continue
+
+
+def run_cli(args):
+    if args.prompt is None:
+        run_interactive(args)
+        return
+    model = resolve_model(args.model) if args.model else DEFAULT_MODEL
+    messages = [{"role": "user", "content": args.prompt}]
+    try:
+        if args.stream:
+            _print_stream(chat(model, messages, stream=True, reasoning_effort=args.effort))
+        else:
+            resp = chat(model, messages, reasoning_effort=args.effort)
+            msg = (resp.get("choices") or [{}])[0].get("message", {})
+            if msg.get("reasoning_content"):
+                print(f"[think] {msg['reasoning_content']}", file=sys.stderr)
+            print(msg.get("content") or "")
+    except GatewayError as e:
+        _report(e)
+        sys.exit(2)
+
+
+def _report(e):
+    print(f"GATEWAY ERROR {e.code}: {e.body[:300]}", file=sys.stderr)
+    if e.is_rate_limited():
+        print("Rate limit burngate. Подожди или добавь второй ключ в .env.", file=sys.stderr)
+    elif e.is_auth_error():
+        print("Ключ burngate не принят. Проверь BURNGATE_API_KEY в .env.", file=sys.stderr)
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    server_version = "DeepSeekGateway/1.0"
+    max_context = int(os.environ.get("GATEWAY_MAX_CONTEXT", "0"))
+
+    def _cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key")
+        self.send_header("Access-Control-Max-Age", "86400")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors_headers()
+        self.end_headers()
+
+    def _auth(self):
+        token = os.environ.get("GATEWAY_TOKEN", "")
+        if token:
+            header = self.headers.get("Authorization", "")
+            if header != f"Bearer {token}" and self.headers.get("x-api-key") != token:
+                self.send_error(401, "Unauthorized")
+                return False
+        return True
+
+    def _reply(self, code, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self._cors_headers()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if not self._auth():
+            return
+        path = self.path.split("?")[0].rstrip("/")
+        if path.endswith("/models"):
+            models = list_models()
+            for alias in MODEL_ALIASES:
+                if alias not in models:
+                    models.append(alias)
+            self._reply(200, {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "burngate"} for m in models]})
+        else:
+            self._reply(404, {"error": {"message": f"not found: {self.path}", "type": "invalid_request_error", "code": 404}})
+
+    def do_POST(self):
+        if not self._auth():
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except Exception:
+            self._reply(400, {"error": {"message": "invalid json", "type": "invalid_request_error", "code": 400}})
+            return
+        path = self.path.split("?")[0].rstrip("/")
+        if "chat/completions" not in path and path not in ("", "/v1", "/v1beta"):
+            self._reply(404, {"error": {"message": f"not found: {self.path}", "type": "invalid_request_error", "code": 404}})
+            return
+        requested = body.get("model") or DEFAULT_MODEL
+        model = resolve_model(requested)
+        messages = body.get("messages") or []
+        stream = bool(body.get("stream", False))
+        opts = {k: v for k, v in body.items() if k not in ("model", "messages", "stream", "_session", "_key")}
+        opts.setdefault("reasoning_effort", DEFAULT_EFFORT)
+        if self.max_context and estimate_tokens(messages) > self.max_context:
+            messages = compact_if_needed(messages, self.max_context)
+        try:
+            if stream:
+                self.send_response(200)
+                self._cors_headers()
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                for chunk, done in chat(model, messages, stream=True, **opts):
+                    if done:
+                        break
+                    out = dict(chunk)
+                    out["model"] = requested
+                    self.wfile.write(f"data: {json.dumps(out)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+            else:
+                resp = chat(model, messages, **opts)
+                self._reply(200, resp)
+        except GatewayError as e:
+            self._reply(e.code if e.code else 502, {"error": {"message": e.body[:400], "type": "api_error", "code": e.code or 502}})
+        except Exception as e:
+            self._reply(500, {"error": {"message": str(e)[:400], "type": "api_error", "code": 500}})
+
+
+def run_gateway(args):
+    port = args.port
+    GatewayHandler.max_context = args.max_context
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), GatewayHandler)
+    print(f"deepseek-gateway on 0.0.0.0:{port}  (POST /v1/chat/completions, GET /v1/models)")
+    print(f"upstream: {BURNGATE_BASE} | model: {DEFAULT_MODEL} | keys: {len(api_keys())}")
+    print(f"auth: {'GATEWAY_TOKEN required' if os.environ.get('GATEWAY_TOKEN') else 'open'}")
+    if os.environ.get("GATEWAY_PROBE", "1") != "0":
+        _probe()
+    httpd.serve_forever()
+
+
+def _probe():
+    """Пробный запрос при старте: показывает, что upstream жив и кто отвечает."""
+    model = os.environ.get("GATEWAY_PROBE_MODEL", DEFAULT_MODEL)
+    try:
+        resp = chat(model, [{"role": "user", "content": "Who are you? Exact model and company. Max 15 words."}],
+                    max_tokens=80, reasoning_effort="none")
+        who = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or "(пустой ответ)"
+        print(f"[probe] {model} -> {who.strip()[:110]}")
+    except GatewayError as e:
+        print(f"[probe] {model} -> ОШИБКА {e.code}: {e.body[:120]}")
+    except Exception as e:
+        print(f"[probe] ошибка: {e}")
+
+
+def main():
+    # Windows: консоль cp1251 не кодирует юникод/эмодзи из ответов. Форсим UTF-8.
+    for _s, _r in ((sys.stdout, sys.stdout.reconfigure), (sys.stderr, sys.stderr.reconfigure)):
+        try:
+            _r(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    ap = argparse.ArgumentParser(description="gateway.py - burngate client + OpenAI-compatible gateway")
+    sub = ap.add_subparsers(dest="cmd")
+    c = sub.add_parser("chat", help="разовый запрос")
+    c.add_argument("prompt", nargs="?", default=None)
+    c.add_argument("-m", "--model", default=None)
+    c.add_argument("--stream", action="store_true")
+    c.add_argument("--effort", default=DEFAULT_EFFORT,
+                   help="reasoning_effort: max/xhigh/high/medium/low/minimal/none (по умолч. %s)" % DEFAULT_EFFORT)
+    g = sub.add_parser("serve", help="поднять OpenAI-совместимый шлюз")
+    g.add_argument("--port", type=int, default=None)
+    g.add_argument("--max-context", type=int, default=None,
+                   help="порог авто-компакта в символах (0 = выключить)")
+    sub.add_parser("models", help="список моделей burngate")
+    args = ap.parse_args()
+
+    if not api_keys():
+        print("ERROR: нет ключа. Впиши BURNGATE_API_KEY=gk_... в .env рядом с gateway.py", file=sys.stderr)
+        sys.exit(1)
+
+    if args.cmd == "models":
+        for m in list_models():
+            print(m)
+    elif args.cmd == "serve":
+        if args.port is None:
+            args.port = int(os.environ.get("GATEWAY_PORT", "8787"))
+        if args.max_context is None:
+            args.max_context = int(os.environ.get("GATEWAY_MAX_CONTEXT", "0"))
+        run_gateway(args)
+    else:
+        args.effort = getattr(args, "effort", DEFAULT_EFFORT)
+        run_cli(args)
+
+
+if __name__ == "__main__":
+    main()
