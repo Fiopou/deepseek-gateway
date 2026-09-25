@@ -12,8 +12,8 @@
 import argparse
 import json
 import os
-import random
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -50,6 +50,7 @@ MODEL_ALIASES = {
     "mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
 }
 
+
 def normalize_model(name):
     """Имя модели к виду алиасов: нижний регистр, пробелы/подчёркивания -> дефисы."""
     key = name.strip().lower().replace("_", "-").replace(" ", "-")
@@ -61,8 +62,46 @@ def normalize_model(name):
 _ENV_MODEL = normalize_model(os.environ.get("BURNGATE_MODEL", ""))
 DEFAULT_MODEL = MODEL_ALIASES.get(_ENV_MODEL, _ENV_MODEL) if _ENV_MODEL else MODELS[0]
 DEFAULT_EFFORT = os.environ.get("BURNGATE_EFFORT", "max").strip() or "max"
+RATE_COOLDOWN = float(os.environ.get("GATEWAY_RATE_COOLDOWN", "20").strip() or "20")
 
 INTERNAL_FIELDS = ("_session", "_key")
+
+_COOLDOWNS = {}
+_COOLDOWN_LOCK = threading.Lock()
+
+
+def _is_rate_limit(msg):
+    low = str(msg).lower()
+    return "rate limit" in low or "too many" in low or "overloaded" in low
+
+
+def _exc_msg(e):
+    if isinstance(e, GatewayError):
+        return e.body
+    return f"network: {e}"
+
+
+def _filter_opts(model, opts):
+    """Gemini у burngate падает на ненулевых presence/frequency_penalty - выкидываем их."""
+    if model.startswith("google/"):
+        for key in ("presence_penalty", "frequency_penalty"):
+            opts.pop(key, None)
+
+
+def _set_cooldown(model, seconds=None):
+    secs = RATE_COOLDOWN if seconds is None else seconds
+    if secs <= 0:
+        return
+    with _COOLDOWN_LOCK:
+        _COOLDOWNS[model] = max(_COOLDOWNS.get(model, 0), time.time() + secs)
+
+
+def _cooldown_wait(model):
+    with _COOLDOWN_LOCK:
+        until = _COOLDOWNS.get(model, 0)
+    delay = until - time.time()
+    if delay > 0:
+        time.sleep(min(delay, 90))
 
 
 def load_dotenv(path):
@@ -160,12 +199,17 @@ class GatewayError(Exception):
     def is_rate_limited(self):
         return self.code in (429, 529) or "rate limit" in self.body.lower() or "RateLimit" in self.body
 
+    def is_network(self):
+        return self.code == 0
+
     def retryable_with_next_key(self):
-        return self.is_auth_error() or self.is_rate_limited()
+        return self.is_auth_error() or self.is_rate_limited() or self.is_network()
 
 
 def _request(payload):
-    """POST /chat/completions с перебором ключей при 401/402/403/429."""
+    """POST /chat/completions с перебором ключей при 401/402/403/429 и сетевых сбоях."""
+    model = payload.get("model")
+    _cooldown_wait(model)
     keys = api_keys()
     if not keys:
         raise GatewayError(0, "BURNGATE_API_KEY не задан: впиши ключ в .env рядом с gateway.py", None)
@@ -186,13 +230,19 @@ def _request(payload):
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")[:500]
             last = GatewayError(e.code, body, e.headers.get("retry-after"))
+            if last.is_rate_limited():
+                _set_cooldown(model)
             if last.retryable_with_next_key() and i < len(keys) - 1:
                 if last.is_rate_limited():
                     time.sleep(1)
                 continue
             raise last
         except urllib.error.URLError as e:
-            raise GatewayError(0, f"network: {e.reason}", None)
+            last = GatewayError(0, f"network: {e.reason}", None)
+            if i < len(keys) - 1:
+                time.sleep(1)
+                continue
+            raise last
     raise last
 
 
@@ -430,26 +480,128 @@ class GatewayHandler(BaseHTTPRequestHandler):
         stream = bool(body.get("stream", False))
         opts = {k: v for k, v in body.items() if k not in ("model", "messages", "stream", "_session", "_key")}
         opts["reasoning_effort"] = DEFAULT_EFFORT
+        _filter_opts(model, opts)
         if self.max_context and estimate_tokens(messages) > self.max_context:
             messages = compact_if_needed(messages, self.max_context)
         try:
             if stream:
+                err_msg = None
+                attempts = 0
+                waits = (1, 2)
+                gen = None
+                while True:
+                    fatal = False
+                    try:
+                        if gen is None:
+                            gen = chat(model, messages, stream=True, **opts)
+                        chunk, done = next(gen)
+                    except StopIteration:
+                        chunk, done = None, True
+                    except (GatewayError, OSError) as e:
+                        chunk, done = {"error": {"message": _exc_msg(e)}}, False
+                        fatal = isinstance(e, GatewayError) and e.is_auth_error()
+                    if not (isinstance(chunk, dict) and chunk.get("error")):
+                        err_msg = None
+                        break
+                    err = chunk["error"]
+                    err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                    if attempts == 0:
+                        if fatal:
+                            waits = ()
+                        elif _is_rate_limit(err_msg):
+                            _set_cooldown(model)
+                            waits = (0, 0, 0)
+                        else:
+                            waits = (1, 2, 4)
+                    if attempts >= len(waits):
+                        break
+                    if gen is not None:
+                        try:
+                            gen.close()
+                        except Exception:
+                            pass
+                        gen = None
+                    time.sleep(waits[attempts])
+                    attempts += 1
+
+                if err_msg is not None:
+                    if gen is not None:
+                        try:
+                            gen.close()
+                        except Exception:
+                            pass
+                    try:
+                        resp = chat(model, messages, **opts)
+                        text = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+                        self.send_response(200)
+                        self._cors_headers()
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.end_headers()
+                        now = int(time.time())
+                        out = {"id": resp.get("id") or "chatcmpl-fallback",
+                               "object": "chat.completion.chunk", "created": now, "model": requested,
+                               "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(out)}\n\n".encode("utf-8"))
+                        out2 = {"object": "chat.completion.chunk", "created": now, "model": requested,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                        self.wfile.write(f"data: {json.dumps(out2)}\n\n".encode("utf-8"))
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except GatewayError as e:
+                        self._reply(502, {"error": {"message": str(e.body)[:400], "type": "stream_error", "code": 502}})
+                    except Exception as e:
+                        self._reply(502, {"error": {"message": str(e)[:400], "type": "stream_error", "code": 502}})
+                    return
+
                 self.send_response(200)
                 self._cors_headers()
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                for chunk, done in chat(model, messages, stream=True, **opts):
-                    if done:
-                        break
-                    out = dict(chunk)
+
+                def emit(item):
+                    out = dict(item)
                     out["model"] = requested
                     self.wfile.write(f"data: {json.dumps(out)}\n\n".encode("utf-8"))
                     self.wfile.flush()
+
+                if isinstance(chunk, dict) and not done:
+                    emit(chunk)
+                while True:
+                    try:
+                        item, done = next(gen)
+                    except StopIteration:
+                        break
+                    except (GatewayError, OSError):
+                        break
+                    if done:
+                        break
+                    if isinstance(item, dict) and item.get("error"):
+                        break
+                    emit(item)
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             else:
-                resp = chat(model, messages, **opts)
+                attempts = 0
+                waits = (1, 2)
+                while True:
+                    try:
+                        resp = chat(model, messages, **opts)
+                        break
+                    except GatewayError as e:
+                        if attempts == 0:
+                            if e.is_rate_limited():
+                                _set_cooldown(model)
+                                waits = (0, 0, 0)
+                            elif e.is_network():
+                                waits = (1, 2)
+                            else:
+                                raise
+                        if attempts >= len(waits):
+                            raise
+                        time.sleep(waits[attempts])
+                        attempts += 1
                 self._reply(200, resp)
         except GatewayError as e:
             self._reply(e.code if e.code else 502, {"error": {"message": e.body[:400], "type": "api_error", "code": e.code or 502}})
