@@ -24,6 +24,7 @@ burngate (https://burngate.space/api/v1)
 2. Подставляет твой ключ burngate и, если ключей несколько, перебирает их при `401`/`429`.
 3. Разбирает потоковые ответы (SSE) обратно клиенту.
 4. Умеет **бесконечный контекст**: когда история вырастает, сам сжимает старые сообщения в резюме.
+5. Гонит **всё с `reasoning_effort=max`**: и ответы, и служебные запросы (проба при старте, сжатие истории). Клиент переопределить не может — только через `BURNGATE_EFFORT`.
 
 ## Модели
 
@@ -109,7 +110,7 @@ model:    deepseek/deepseek-v4.1-flash   # или gemini
 | `BURNGATE_API_KEYS` | несколько ключей через запятую — перебор при ошибках |
 | `BURNGATE_BASE` | базовый URL burngate (по умолч. `https://burngate.space/api/v1`) |
 | `BURNGATE_MODEL` | модель по умолчанию: `deepseek` (по умолч.) или `gemini`, либо полный id |
-| `BURNGATE_EFFORT` | `reasoning_effort` по умолчанию (по умолч. `max`) |
+| `BURNGATE_EFFORT` | `reasoning_effort` для всех запросов шлюза — форсится поверх клиента (по умолч. `max`) |
 | `GATEWAY_PORT` | порт шлюза (по умолч. 8787) |
 | `GATEWAY_TOKEN` | пароль шлюза (Bearer) |
 | `GATEWAY_MAX_CONTEXT` | порог сжатия истории, символов (0 = выключить) |

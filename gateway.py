@@ -242,7 +242,7 @@ def _summarize(text):
         "и незавершённые задачи. Числа, коды, имена и ключевые термины перечисли "
         "списком, ничего не теряя. Только резюме, без пояснений.\n\n" + text
     )
-    resp = chat(DEFAULT_MODEL, [{"role": "user", "content": prompt}], max_tokens=800, reasoning_effort="none")
+    resp = chat(DEFAULT_MODEL, [{"role": "user", "content": prompt}], max_tokens=4000, reasoning_effort=DEFAULT_EFFORT)
     return (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
 
 
@@ -417,7 +417,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         messages = body.get("messages") or []
         stream = bool(body.get("stream", False))
         opts = {k: v for k, v in body.items() if k not in ("model", "messages", "stream", "_session", "_key")}
-        opts.setdefault("reasoning_effort", DEFAULT_EFFORT)
+        opts["reasoning_effort"] = DEFAULT_EFFORT
         if self.max_context and estimate_tokens(messages) > self.max_context:
             messages = compact_if_needed(messages, self.max_context)
         try:
@@ -465,7 +465,7 @@ def _probe():
     model = os.environ.get("GATEWAY_PROBE_MODEL", DEFAULT_MODEL)
     try:
         resp = chat(model, [{"role": "user", "content": "Who are you? Exact model and company. Max 15 words."}],
-                    max_tokens=80, reasoning_effort="none")
+                    max_tokens=4000, reasoning_effort=DEFAULT_EFFORT)
         who = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or "(пустой ответ)"
         print(f"[probe] {model} -> {who.strip()[:110]}")
     except GatewayError as e:
