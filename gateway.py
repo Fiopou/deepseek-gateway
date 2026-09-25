@@ -23,10 +23,12 @@ BURNGATE_BASE = os.environ.get("BURNGATE_BASE", "https://burngate.space/api/v1")
 TIMEOUT = int(os.environ.get("GATEWAY_TIMEOUT", "300"))
 UA = "deepseek-gateway/1.0"
 
-# Модели burngate. Первая - модель по умолчанию.
+# Модели burngate. Первая - модель по умолчанию (меняется через BURNGATE_MODEL или serve --model).
 MODELS = [
     "deepseek/deepseek-v4.1-flash",
-    "z-ai/glm-5.3-flash",
+    "google/gemini-3.8-flash",
+    "stealth/space-bunny-alpha",
+    "xiaomi/mimo-v2.6-flash",
 ]
 
 # Короткие имена для удобных клиентов -> полный id burngate.
@@ -35,12 +37,20 @@ MODEL_ALIASES = {
     "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
     "deepseek-v4.1": "deepseek/deepseek-v4.1-flash",
     "deepseek-flash": "deepseek/deepseek-v4.1-flash",
-    "glm": "z-ai/glm-5.3-flash",
-    "glm-5.3-flash": "z-ai/glm-5.3-flash",
+    "gemini": "google/gemini-3.8-flash",
+    "gemini-3.8-flash": "google/gemini-3.8-flash",
+    "gemini-3.8": "google/gemini-3.8-flash",
+    "gemini-flash": "google/gemini-3.8-flash",
+    "bunny": "stealth/space-bunny-alpha",
+    "space-bunny": "stealth/space-bunny-alpha",
+    "space-bunny-alpha": "stealth/space-bunny-alpha",
+    "mimo": "xiaomi/mimo-v2.6-flash",
+    "mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
 }
 
-DEFAULT_MODEL = MODELS[0]
-DEFAULT_EFFORT = os.environ.get("BURNGATE_EFFORT", "high").strip() or "high"
+_ENV_MODEL = os.environ.get("BURNGATE_MODEL", "").strip().lower()
+DEFAULT_MODEL = MODEL_ALIASES.get(_ENV_MODEL, _ENV_MODEL) if _ENV_MODEL else MODELS[0]
+DEFAULT_EFFORT = os.environ.get("BURNGATE_EFFORT", "max").strip() or "max"
 
 INTERNAL_FIELDS = ("_session", "_key")
 
@@ -436,6 +446,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 def run_gateway(args):
+    global DEFAULT_MODEL
+    if getattr(args, "model", None):
+        DEFAULT_MODEL = resolve_model(args.model)
     port = args.port
     GatewayHandler.max_context = args.max_context
     httpd = ThreadingHTTPServer(("0.0.0.0", port), GatewayHandler)
@@ -479,6 +492,8 @@ def main():
                    help="reasoning_effort: max/xhigh/high/medium/low/minimal/none (по умолч. %s)" % DEFAULT_EFFORT)
     g = sub.add_parser("serve", help="поднять OpenAI-совместимый шлюз")
     g.add_argument("--port", type=int, default=None)
+    g.add_argument("--model", default=None,
+                   help="модель по умолчанию: deepseek (по умолч.), gemini или полный id")
     g.add_argument("--max-context", type=int, default=None,
                    help="порог авто-компакта в символах (0 = выключить)")
     sub.add_parser("models", help="список моделей burngate")

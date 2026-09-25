@@ -1,10 +1,10 @@
 # deepseek-gateway
 
-OpenAI-совместимый API к **burngate** (`deepseek/deepseek-v4.1-flash`). Один файл, ноль зависимостей.
+OpenAI-совместимый API к **burngate** (DeepSeek V4.1 Flash или Gemini 3.8 Flash). Один файл, ноль зависимостей.
 
 ## Что это, простыми словами
 
-**burngate** — это шлюз к разным провайдерам моделей с единой OpenAI-ручкой. У него есть модель **DeepSeek V4.1 Flash** и **GLM 5.3 Flash**.
+**burngate** — это шлюз к разным провайдерам моделей с единой OpenAI-ручкой. У него есть модели **DeepSeek V4.1 Flash** и **Gemini 3.8 Flash** (а ещё Space Bunny Alpha и MiMo V2.6 Flash).
 
 **deepseek-gateway** — маленький сервер, который держит твой ключ burngate и раздаёт его дальше как обычный OpenAI API. На телефон, на комп, куда угодно. Для джанитора/таверны это просто `http://localhost:8787/v1`.
 
@@ -30,9 +30,16 @@ burngate (https://burngate.space/api/v1)
 | модель | алиасы | что за зверь |
 |---|---|---|
 | `deepseek/deepseek-v4.1-flash` | `deepseek`, `deepseek-v4.1-flash` | DeepSeek V4.1 Flash — по умолчанию |
-| `z-ai/glm-5.3-flash` | `glm`, `glm-5.3-flash` | GLM 5.3 Flash |
+| `google/gemini-3.8-flash` | `gemini`, `gemini-3.8-flash` | Gemini 3.8 Flash |
+| `stealth/space-bunny-alpha` | `bunny`, `space-bunny` | Space Bunny Alpha |
+| `xiaomi/mimo-v2.6-flash` | `mimo` | MiMo V2.6 Flash |
 
-Можно писать короткий алиас — шлюз развернёт его в полный id.
+Можно писать короткий алиас — шлюз развернёт его в полный id. Клиент выбирает модель в каждом запросе полем `model` (`deepseek`, `gemini`, ...).
+
+Модель по умолчанию (когда клиент не указал модель) — deepseek. Как сменить:
+
+- `BURNGATE_MODEL=gemini` в `.env`, или
+- `python gateway.py serve --model gemini`.
 
 ## Установка
 
@@ -77,7 +84,7 @@ python gateway.py serve --port 8787
 ```
 base_url: http://localhost:8787/v1
 api_key:  любая строка (например burn)
-model:    deepseek/deepseek-v4.1-flash
+model:    deepseek/deepseek-v4.1-flash   # или gemini
 ```
 
 Если клиент на другом устройстве — вместо `localhost` IP машины со шлюзом (Termux: `ip addr show wlan0`).
@@ -87,6 +94,7 @@ model:    deepseek/deepseek-v4.1-flash
 | команда | что делает |
 |---|---|
 | `python gateway.py serve --port 8787` | запустить шлюз |
+| `python gateway.py serve --model gemini` | шлюз с gemini по умолчанию |
 | `python gateway.py chat` | чат в терминале (с авто-компактом) |
 | `python gateway.py chat "промпт"` | разовый запрос |
 | `python gateway.py chat "промпт" --stream` | стрим, мысли в stderr |
@@ -100,7 +108,8 @@ model:    deepseek/deepseek-v4.1-flash
 | `BURNGATE_API_KEY` | **ключ burngate** — обязателен (лежит в `.env`) |
 | `BURNGATE_API_KEYS` | несколько ключей через запятую — перебор при ошибках |
 | `BURNGATE_BASE` | базовый URL burngate (по умолч. `https://burngate.space/api/v1`) |
-| `BURNGATE_EFFORT` | `reasoning_effort` по умолчанию (по умолч. `high`) |
+| `BURNGATE_MODEL` | модель по умолчанию: `deepseek` (по умолч.) или `gemini`, либо полный id |
+| `BURNGATE_EFFORT` | `reasoning_effort` по умолчанию (по умолч. `max`) |
 | `GATEWAY_PORT` | порт шлюза (по умолч. 8787) |
 | `GATEWAY_TOKEN` | пароль шлюза (Bearer) |
 | `GATEWAY_MAX_CONTEXT` | порог сжатия истории, символов (0 = выключить) |
