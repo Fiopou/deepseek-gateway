@@ -35,7 +35,7 @@ burngate (https://burngate.space/api/v1)
 | `stealth/space-bunny-alpha` | `bunny`, `space-bunny` | Space Bunny Alpha |
 | `xiaomi/mimo-v2.6-flash` | `mimo` | MiMo V2.6 Flash |
 
-Можно писать короткий алиас — шлюз развернёт его в полный id. Клиент выбирает модель в каждом запросе полем `model` (`deepseek`, `gemini`, ...).
+Можно писать короткий алиас — шлюз развернёт его в полный id. Клиент выбирает модель в каждом запросе полем `model` (`deepseek`, `gemini`, ...). Регистр, пробелы и подчёркивания не важны: `Gemini 3.8 Flash`, `gemini`, `GEMINI-3.8-FLASH` — всё указывает на одну модель.
 
 Модель по умолчанию (когда клиент не указал модель) — deepseek. Как сменить:
 

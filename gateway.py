@@ -36,6 +36,8 @@ MODEL_ALIASES = {
     "deepseek": "deepseek/deepseek-v4.1-flash",
     "deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
     "deepseek-v4.1": "deepseek/deepseek-v4.1-flash",
+    "deepseek-4.1": "deepseek/deepseek-v4.1-flash",
+    "deepseek-4.1-flash": "deepseek/deepseek-v4.1-flash",
     "deepseek-flash": "deepseek/deepseek-v4.1-flash",
     "gemini": "google/gemini-3.8-flash",
     "gemini-3.8-flash": "google/gemini-3.8-flash",
@@ -48,7 +50,15 @@ MODEL_ALIASES = {
     "mimo-v2.6-flash": "xiaomi/mimo-v2.6-flash",
 }
 
-_ENV_MODEL = os.environ.get("BURNGATE_MODEL", "").strip().lower()
+def normalize_model(name):
+    """Имя модели к виду алиасов: нижний регистр, пробелы/подчёркивания -> дефисы."""
+    key = name.strip().lower().replace("_", "-").replace(" ", "-")
+    while "--" in key:
+        key = key.replace("--", "-")
+    return key
+
+
+_ENV_MODEL = normalize_model(os.environ.get("BURNGATE_MODEL", ""))
 DEFAULT_MODEL = MODEL_ALIASES.get(_ENV_MODEL, _ENV_MODEL) if _ENV_MODEL else MODELS[0]
 DEFAULT_EFFORT = os.environ.get("BURNGATE_EFFORT", "max").strip() or "max"
 
@@ -129,10 +139,12 @@ def ensure_key():
 
 
 def resolve_model(name):
-    """Короткое имя -> полный id burngate. Неизвестное возвращаем как есть."""
+    """Короткое имя или отображаемое название -> полный id burngate. Неизвестное возвращаем как есть.
+    Понимает любой регистр, пробелы и подчёркивания: "Gemini 3.8 Flash" -> google/gemini-3.8-flash."""
     if not name:
         return DEFAULT_MODEL
-    return MODEL_ALIASES.get(name.strip().lower(), name.strip())
+    raw = name.strip()
+    return MODEL_ALIASES.get(normalize_model(raw), raw)
 
 
 class GatewayError(Exception):
