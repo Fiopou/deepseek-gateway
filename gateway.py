@@ -268,6 +268,74 @@ def _iter_sse(resp):
     yield None, True
 
 
+def extra_system_text():
+    """Текст из GATEWAY_EXTRA_SYSTEM или GATEWAY_EXTRA_SYSTEM_FILE (первый приоритетнее)."""
+    text = os.environ.get("GATEWAY_EXTRA_SYSTEM", "").strip()
+    if text:
+        return text
+    path = os.environ.get("GATEWAY_EXTRA_SYSTEM_FILE", "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def apply_extra_system(messages):
+    """Дописывает extra-текст в конец system-сообщения; если system нет - создаёт его."""
+    extra = extra_system_text()
+    if not extra:
+        return messages
+    msgs = [dict(m) for m in messages]
+    for m in msgs:
+        if m.get("role") == "system" and isinstance(m.get("content"), str):
+            m["content"] = m["content"].rstrip() + "\n\n" + extra
+            return msgs
+    msgs.insert(0, {"role": "system", "content": extra})
+    return msgs
+
+
+def extra_applies(model, requested):
+    """Фильтр GATEWAY_EXTRA_SYSTEM_MODELS: пусто - применять ко всем; иначе к перечисленным моделям."""
+    sel = os.environ.get("GATEWAY_EXTRA_SYSTEM_MODELS", "").strip()
+    if not sel:
+        return True
+    names = [s.strip().lower() for s in sel.split(",") if s.strip()]
+    model = (model or "").lower()
+    requested = (requested or "").lower()
+    return any(n == model or n == requested or model.startswith(n) for n in names)
+
+
+def prefill_text():
+    """Текст из GATEWAY_PREFILL или GATEWAY_PREFILL_FILE (первый приоритетнее)."""
+    text = os.environ.get("GATEWAY_PREFILL", "")
+    if text.strip():
+        return text
+    path = os.environ.get("GATEWAY_PREFILL_FILE", "").strip()
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def apply_prefill(messages):
+    """Добавляет хвостовое assistant-сообщение - модель продолжает текст, а не решает, начать ли."""
+    text = prefill_text().strip()
+    if not text:
+        return messages
+    msgs = [dict(m) for m in messages]
+    if msgs and msgs[-1].get("role") == "assistant" and isinstance(msgs[-1].get("content"), str):
+        msgs[-1]["content"] = (msgs[-1]["content"].rstrip() + " " + text).strip()
+        return msgs
+    msgs.append({"role": "assistant", "content": text})
+    return msgs
+
+
 def chat(model, messages, stream=False, **opts):
     """Одиночный вызов burngate. Возвращает dict (не-стрим) или итератор чанков."""
     payload = {"model": resolve_model(model), "messages": messages, "stream": bool(stream)}
@@ -483,6 +551,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         _filter_opts(model, opts)
         if self.max_context and estimate_tokens(messages) > self.max_context:
             messages = compact_if_needed(messages, self.max_context)
+        if extra_applies(model, requested):
+            messages = apply_extra_system(messages)
+            messages = apply_prefill(messages)
         try:
             if stream:
                 err_msg = None
@@ -619,6 +690,9 @@ def run_gateway(args):
     print(f"deepseek-gateway on 0.0.0.0:{port}  (POST /v1/chat/completions, GET /v1/models)")
     print(f"upstream: {BURNGATE_BASE} | model: {DEFAULT_MODEL} | keys: {len(api_keys())}")
     print(f"auth: {'GATEWAY_TOKEN required' if os.environ.get('GATEWAY_TOKEN') else 'open'}")
+    if extra_system_text() or prefill_text().strip():
+        sel = os.environ.get("GATEWAY_EXTRA_SYSTEM_MODELS", "").strip()
+        print(f"extra/prefill: on{' | models: ' + sel if sel else ''}")
     if os.environ.get("GATEWAY_PROBE", "1") != "0":
         _probe()
     httpd.serve_forever()

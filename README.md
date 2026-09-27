@@ -117,6 +117,9 @@ model:    deepseek/deepseek-v4.1-flash   # или gemini
 | `GATEWAY_MAX_CONTEXT` | порог сжатия истории, символов (0 = выключить) |
 | `GATEWAY_RATE_COOLDOWN` | пауза на модель после rate limit burngate, сек (по умолч. `20`, 0 = выключить) |
 | `GATEWAY_PROBE=0` | отключить пробный запрос при старте |
+| `GATEWAY_EXTRA_SYSTEM` / `GATEWAY_EXTRA_SYSTEM_FILE` | дописать текст в system-сообщение каждого запроса (для многострочного удобнее файл) |
+| `GATEWAY_PREFILL` / `GATEWAY_PREFILL_FILE` | добавить стартовый assistant-ход, чтобы модель продолжала текст вместо «решить, отвечать ли»; работает на deepseek/mimo, Gemini на такой хвост отвечает ошибкой upstream |
+| `GATEWAY_EXTRA_SYSTEM_MODELS` | к каким моделям применять extra-system и prefill (через запятую, по алиасу или id; пусто = ко всем) |
 | `GATEWAY_TIMEOUT` | таймаут запросов, сек (по умолч. 300) |
 
 `reasoning_effort`: `max`, `xhigh`, `high`, `medium`, `low`, `minimal`, `none`.
